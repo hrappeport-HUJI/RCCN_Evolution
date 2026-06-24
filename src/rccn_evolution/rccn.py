@@ -232,8 +232,8 @@ def simulate_lag_times_torch(
                     break
 
         field = h if params.equilibration_time <= t < lag_start_time else 0.0
-        inputs = spins[:, c_idx] @ J_t.T + field
-        spins[:, fc_idx] = torch.where(inputs >= 0, 1.0, -1.0)
+        inputs = spins[:, fc_idx] + spins[:, c_idx] @ J_t.T + field
+        spins[:, fc_idx] = torch.sign(inputs)
         c_idx = fc_idx.clone()
         fc_idx = (fc_idx - starts - 1) % topology_t + starts
 
@@ -295,8 +295,8 @@ def simulate_lag_times(
                     break
 
         field = h if params.equilibration_time <= t < lag_start_time else 0.0
-        inputs = spins[:, c_idx] @ J.T + field
-        spins[:, fc_idx] = np.where(inputs >= 0, 1.0, -1.0)
+        inputs = spins[:, fc_idx] + spins[:, c_idx] @ J.T + field
+        spins[:, fc_idx] = np.sign(inputs)
         c_idx = fc_idx.copy()
         _rewind_feeders(fc_idx, topology)
 
