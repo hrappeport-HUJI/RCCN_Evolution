@@ -64,13 +64,20 @@ def save_plots(
     max_lag = max(float(np.max(lags)) for by_tw in all_lags.values() for lags in by_tw.values())
     xlim = (0, max(50, max_lag * 1.05))
 
-    fig, axes = plt.subplots(2, 5, figsize=(18, 7), sharex=True, sharey=True)
+    fig, axes = plt.subplots(2, 5, figsize=(18, 7.6), sharex=True, sharey=True)
     for anc_i, ax in zip(sorted(all_lags), axes.flat):
         plot_one_minus_cdfs(all_lags[anc_i], ax, title=f"Ancestor J {anc_i}", xlim=xlim)
     handles, labels = axes.flat[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=len(labels), frameon=False)
-    fig.suptitle("Ancestor RCCN aging: lag 1-CDFs", y=1.02)
-    fig.tight_layout()
+    fig.suptitle("Ancestor RCCN aging: lag 1-CDFs", y=0.985)
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.95),
+        ncol=len(labels),
+        frameon=False,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.90))
     fig.savefig(out_dir / "ancestor_aging_1cdf_grid.png", dpi=220, bbox_inches="tight")
     fig.savefig(out_dir / "ancestor_aging_1cdf_grid.pdf", bbox_inches="tight")
     plt.close(fig)
@@ -179,4 +186,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
