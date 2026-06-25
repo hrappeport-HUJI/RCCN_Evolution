@@ -175,6 +175,7 @@ def run_evolution(
     rccn_params: RCCNParameters,
     rng: np.random.Generator | None = None,
     mutator: Callable[[np.ndarray, np.random.Generator], np.ndarray] | None = None,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> EvolutionResult:
     """Run serial-dilution evolution starting from a single RCCN genotype."""
 
@@ -235,5 +236,7 @@ def run_evolution(
                 "n_new_mutants": sum(len(v) for v in parent_mutants.values()),
             }
         )
+        if progress_callback is not None:
+            progress_callback(history[-1])
 
     return EvolutionResult(J_dict=J_dict, population=population, history=history)
