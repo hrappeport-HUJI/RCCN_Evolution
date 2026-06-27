@@ -159,6 +159,252 @@ def _loop_magnetization_torch(spins, loop_slices):
     )
 
 
+def _torch_tensor(array, *, dtype, device):
+    import torch
+
+    try:
+        return torch.as_tensor(array, dtype=dtype, device=device)
+    except Exception:
+        # Older Torch wheels can fail against newer NumPy arrays. Keep a slower
+        # list fallback for portability, but prefer zero-copy/as_tensor above.
+        return torch.tensor(np.asarray(array).tolist(), dtype=dtype, device=device)
+
+
+def _run_lag_times_batched_torch(
+    Js: np.ndarray,
+    spins: np.ndarray,
+    topology: np.ndarray,
+    H: np.ndarray,
+    c_idx: np.ndarray,
+    fc_idx: np.ndarray,
+    lag_start_time: int,
+    *,
+    device: str | None = None,
+) -> np.ndarray:
+    """Run the original batched-J RCCN lag kernel with Torch tensors.
+
+    This mirrors the old RCCN implementation's low-level signature, including
+    accepting one J matrix per realization.
+    """
+
+    import torch
+
+    Js_np = np.asarray(Js, dtype=np.float32)
+    spins_np = np.asarray(spins, dtype=np.float32)
+    topology_np = np.asarray(topology, dtype=np.int32)
+    H_np = np.asarray(H, dtype=np.float32)
+    c_idx_np = np.asarray(c_idx, dtype=np.int64)
+    fc_idx_np = np.asarray(fc_idx, dtype=np.int64)
+
+    if Js_np.ndim not in {2, 3}:
+        raise ValueError("Js must have shape (n_loops, n_loops) or (n_realizations, n_loops, n_loops)")
+    if spins_np.ndim != 2:
+        raise ValueError("spins must have shape (n_realizations, n_spins)")
+    if Js_np.ndim == 3 and Js_np.shape[0] != spins_np.shape[0]:
+        raise ValueError("batched Js and spins must have the same number of realizations")
+    if Js_np.shape[-2:] != (len(topology_np), len(topology_np)):
+        raise ValueError("Js must have trailing shape (n_loops, n_loops)")
+    if spins_np.shape[1] != int(np.sum(topology_np)):
+        raise ValueError("spins width must match sum(topology)")
+
+    torch_device = _torch_device(device)
+    Js_t = _torch_tensor(Js_np, dtype=torch.float32, device=torch_device)
+    spins_t = _torch_tensor(spins_np, dtype=torch.float32, device=torch_device)
+    topology_t = _torch_tensor(topology_np, dtype=torch.long, device=torch_device)
+    H_t = _torch_tensor(H_np, dtype=torch.float32, device=torch_device)
+    c_idx_t = _torch_tensor(c_idx_np, dtype=torch.long, device=torch_device)
+    fc_idx_t = _torch_tensor(fc_idx_np, dtype=torch.long, device=torch_device)
+
+    starts_np = np.zeros(len(topology_np), dtype=np.int64)
+    starts_np[1:] = np.cumsum(topology_np[:-1])
+    starts = _torch_tensor(starts_np, dtype=torch.long, device=torch_device)
+
+    n_realizations = spins_t.shape[0]
+    lag_times = torch.full(
+        (n_realizations,),
+        int(len(H_np) - lag_start_time),
+        dtype=torch.long,
+        device=torch_device,
+    )
+    active_original_idx = torch.arange(n_realizations, dtype=torch.long, device=torch_device)
+
+    loop_slices = []
+    start = 0
+    for loop_len in topology_np:
+        end = start + int(loop_len)
+        loop_slices.append((start, end))
+        start = end
+
+    for t in range(len(H_np)):
+        if t > lag_start_time and len(spins_t):
+            mean_mag = _loop_magnetization_torch(spins_t, loop_slices).mean(dim=1)
+            recovered = mean_mag <= 0
+            n_recovered = torch.count_nonzero(recovered)
+            if n_recovered:
+                lag_times[active_original_idx[recovered]] = t - lag_start_time
+                if int(n_recovered.item()) == len(spins_t):
+                    return np.asarray(lag_times.cpu().tolist(), dtype=np.int32)
+
+                keep = ~recovered
+                spins_t = spins_t[keep]
+                active_original_idx = active_original_idx[keep]
+                if Js_t.ndim == 3:
+                    Js_t = Js_t[keep]
+
+        connector = spins_t[:, c_idx_t]
+        if Js_t.ndim == 3:
+            coupling = torch.bmm(Js_t, connector[:, :, None]).squeeze(-1)
+        else:
+            coupling = connector @ Js_t.T
+        spins_t[:, fc_idx_t] += coupling + H_t[t]
+        spins_t[:, fc_idx_t] = torch.sign(spins_t[:, fc_idx_t])
+        c_idx_t = fc_idx_t.clone()
+        fc_idx_t = (fc_idx_t - starts - 1) % topology_t + starts
+
+    return np.asarray(lag_times.cpu().tolist(), dtype=np.int32)
+
+
+def simulate_lag_times_batched_torch(
+    Js: np.ndarray,
+    topology: np.ndarray,
+    params: RCCNParameters | None = None,
+    rng: np.random.Generator | None = None,
+    initial_spins: np.ndarray | None = None,
+) -> np.ndarray:
+    """Torch/GPU lag simulation for one J matrix per realization."""
+
+    params = RCCNParameters() if params is None else params
+    rng = np.random.default_rng() if rng is None else rng
+    topology_np = np.asarray(topology, dtype=np.int32)
+    Js_np = np.asarray(Js, dtype=np.float32)
+
+    if Js_np.ndim != 3:
+        raise ValueError("Js must have shape (n_realizations, n_loops, n_loops)")
+    if Js_np.shape[1:] != (len(topology_np), len(topology_np)):
+        raise ValueError("Js must have shape (n_realizations, n_loops, n_loops)")
+
+    n_realizations = int(Js_np.shape[0])
+    if n_realizations <= 0:
+        return np.empty(0, dtype=np.int32)
+
+    n_spins = int(np.sum(topology_np))
+    spins = (
+        np.asarray(initial_spins, dtype=np.float32)
+        if initial_spins is not None
+        else create_spins(n_realizations, n_spins, rng=rng, p=params.spins_p)
+    )
+    h = field_strength(topology_np) if params.h is None else params.h
+    lag_start_time = params.equilibration_time + params.T_w
+    sim_len = lag_start_time + params.relaxation_time
+    H = np.zeros((sim_len, len(topology_np)), dtype=np.float32)
+    H[params.equilibration_time:lag_start_time, :] = h
+    c_idx, fc_idx = _feeding_indices(topology_np)
+    return _run_lag_times_batched_torch(
+        Js_np,
+        spins,
+        topology_np,
+        H,
+        c_idx,
+        fc_idx,
+        lag_start_time,
+        device=params.device,
+    )
+
+
+def _run_lag_times_batched_numpy(
+    Js: np.ndarray,
+    spins: np.ndarray,
+    topology: np.ndarray,
+    H: np.ndarray,
+    c_idx: np.ndarray,
+    fc_idx: np.ndarray,
+    lag_start_time: int,
+) -> np.ndarray:
+    Js_active = np.asarray(Js, dtype=np.float32)
+    spins_active = np.asarray(spins, dtype=np.float32)
+    topology_np = np.asarray(topology, dtype=np.int32)
+    lag_times = np.full(len(spins_active), len(H) - lag_start_time, dtype=np.int32)
+    active_original_idx = np.arange(len(spins_active))
+
+    for t in range(len(H)):
+        if t > lag_start_time and len(spins_active):
+            mean_mag = _loop_magnetization(spins_active, topology_np).mean(axis=1)
+            recovered = mean_mag <= 0
+            if np.any(recovered):
+                lag_times[active_original_idx[recovered]] = t - lag_start_time
+                keep = ~recovered
+                if not np.any(keep):
+                    break
+                spins_active = spins_active[keep]
+                Js_active = Js_active[keep]
+                active_original_idx = active_original_idx[keep]
+
+        connector = spins_active[:, c_idx]
+        coupling = np.einsum("nij,nj->ni", Js_active, connector, optimize=True)
+        spins_active[:, fc_idx] += coupling + H[t]
+        spins_active[:, fc_idx] = np.sign(spins_active[:, fc_idx])
+        c_idx = fc_idx.copy()
+        _rewind_feeders(fc_idx, topology_np)
+
+    return lag_times
+
+
+def simulate_lag_times_batched(
+    Js: np.ndarray,
+    topology: np.ndarray,
+    params: RCCNParameters | None = None,
+    rng: np.random.Generator | None = None,
+    initial_spins: np.ndarray | None = None,
+) -> np.ndarray:
+    """Simulate lag times for a population with one J matrix per realization."""
+
+    params = RCCNParameters() if params is None else params
+    if params.backend not in {"auto", "numpy", "torch"}:
+        raise ValueError("backend must be one of: 'auto', 'numpy', 'torch'")
+    if params.backend == "torch" or (
+        params.backend == "auto" and (params.device is not None or _has_torch_accelerator())
+    ):
+        return simulate_lag_times_batched_torch(
+            Js,
+            topology,
+            params=params,
+            rng=rng,
+            initial_spins=initial_spins,
+        )
+
+    rng = np.random.default_rng() if rng is None else rng
+    topology_np = np.asarray(topology, dtype=np.int32)
+    Js_np = np.asarray(Js, dtype=np.float32)
+    if Js_np.ndim != 3:
+        raise ValueError("Js must have shape (n_realizations, n_loops, n_loops)")
+    if Js_np.shape[1:] != (len(topology_np), len(topology_np)):
+        raise ValueError("Js must have shape (n_realizations, n_loops, n_loops)")
+    if Js_np.shape[0] <= 0:
+        return np.empty(0, dtype=np.int32)
+
+    n_spins = int(np.sum(topology_np))
+    spins = (
+        np.asarray(initial_spins, dtype=np.float32)
+        if initial_spins is not None
+        else create_spins(Js_np.shape[0], n_spins, rng=rng, p=params.spins_p)
+    )
+    h = field_strength(topology_np) if params.h is None else params.h
+    lag_start_time = params.equilibration_time + params.T_w
+    sim_len = lag_start_time + params.relaxation_time
+    H = np.zeros((sim_len, len(topology_np)), dtype=np.float32)
+    H[params.equilibration_time:lag_start_time, :] = h
+    c_idx, fc_idx = _feeding_indices(topology_np)
+    return _run_lag_times_batched_numpy(
+        Js_np,
+        spins,
+        topology_np,
+        H,
+        c_idx,
+        fc_idx,
+        lag_start_time,
+    )
+
+
 def simulate_lag_times_torch(
     J: np.ndarray,
     topology: np.ndarray,

@@ -6,7 +6,7 @@ from typing import Callable
 
 import numpy as np
 
-from .rccn import RCCNParameters, j_sigma, simulate_lag_times
+from .rccn import RCCNParameters, j_sigma, simulate_lag_times_batched
 
 
 @dataclass(frozen=True)
@@ -187,16 +187,13 @@ def run_evolution(
     history: list[dict] = []
 
     for cycle in range(1, config.n_cycles + 1):
-        lag_times = np.empty(len(population), dtype=np.int32)
-        for g in np.unique(population):
-            idx = np.flatnonzero(population == g)
-            lag_times[idx] = simulate_lag_times(
-                J_dict[int(g)],
-                topology,
-                n_realizations=len(idx),
-                params=rccn_params,
-                rng=rng,
-            )
+        Js = np.stack([J_dict[int(g)] for g in population], axis=0)
+        lag_times = simulate_lag_times_batched(
+            Js,
+            topology,
+            params=rccn_params,
+            rng=rng,
+        )
 
         if config.antibiotic_duration is not None:
             lag_times = lag_times.copy()

@@ -8,6 +8,8 @@ from .rccn import (
     gen_topology,
     j_sigma,
     simulate_lag_times,
+    simulate_lag_times_batched,
+    simulate_lag_times_batched_torch,
     simulate_lag_times_torch,
 )
 from .evolution import (
@@ -26,6 +28,8 @@ __all__ = [
     "gen_topology",
     "j_sigma",
     "simulate_lag_times",
+    "simulate_lag_times_batched",
+    "simulate_lag_times_batched_torch",
     "simulate_lag_times_torch",
     "EvolutionConfig",
     "EvolutionResult",
