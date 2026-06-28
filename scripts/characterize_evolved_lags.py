@@ -101,7 +101,12 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def plot_lag_vs_tw(rows: list[dict], strains: list[Strain], out_dir: Path) -> None:
+def plot_lag_vs_tw(
+    rows: list[dict],
+    strains: list[Strain],
+    out_dir: Path,
+    train_t_w: int,
+) -> None:
     by_name = {strain.name: [] for strain in strains}
     for row in rows:
         by_name[row["strain"]].append(row)
@@ -110,25 +115,53 @@ def plot_lag_vs_tw(rows: list[dict], strains: list[Strain], out_dir: Path) -> No
     for strain in strains:
         strain_rows = sorted(by_name[strain.name], key=lambda r: r["T_w"])
         t_ws = [r["T_w"] for r in strain_rows]
-        means = [r["mean"] for r in strain_rows]
         medians = [r["median"] for r in strain_rows]
+        p90s = [r["p90"] for r in strain_rows]
         label = "ancestor" if strain.kind == "ancestor" else strain.name
         lw = 2.5 if strain.kind == "ancestor" else 1.6
-        axes[0].plot(t_ws, means, marker="o", lw=lw, label=label)
-        axes[1].plot(t_ws, medians, marker="o", lw=lw, label=label)
+        axes[0].plot(t_ws, medians, marker="o", lw=lw, label=label)
+        axes[1].plot(t_ws, p90s, marker="o", lw=lw, label=label)
+        if train_t_w in t_ws:
+            train_i = t_ws.index(train_t_w)
+            axes[0].plot(
+                [train_t_w],
+                [medians[train_i]],
+                marker="*",
+                markersize=12,
+                color=axes[0].lines[-1].get_color(),
+                markeredgecolor="black",
+                markeredgewidth=0.55,
+            )
+            axes[1].plot(
+                [train_t_w],
+                [p90s[train_i]],
+                marker="*",
+                markersize=12,
+                color=axes[1].lines[-1].get_color(),
+                markeredgecolor="black",
+                markeredgewidth=0.55,
+            )
 
-    axes[0].set_title("Mean lag")
-    axes[1].set_title("Median lag")
+    axes[0].set_title("Median lag")
+    axes[1].set_title("90th percentile lag")
     for ax in axes:
         ax.set_xscale("log")
         ax.set_xlabel("T_w")
         ax.set_ylabel("Recovery lag")
+        ax.axvline(
+            train_t_w,
+            color="0.2",
+            ls="--",
+            lw=1.1,
+            alpha=0.75,
+            label="train T_w" if ax is axes[1] else None,
+        )
         ax.grid(alpha=0.22)
     axes[1].legend(frameon=False, fontsize=8, ncol=1)
     fig.suptitle("RCCN lag versus waiting time")
     fig.tight_layout()
-    fig.savefig(out_dir / "lag_vs_Tw_mean_median.png", dpi=220)
-    fig.savefig(out_dir / "lag_vs_Tw_mean_median.pdf")
+    fig.savefig(out_dir / "lag_vs_Tw_median_p90.png", dpi=220)
+    fig.savefig(out_dir / "lag_vs_Tw_median_p90.pdf")
     plt.close(fig)
 
 
@@ -194,6 +227,41 @@ def plot_aging_cdf_grid(
     plt.close(fig)
 
 
+def plot_individual_aging_cdfs(
+    lags_by_strain_tw: dict[str, dict[int, np.ndarray]],
+    strains: list[Strain],
+    out_dir: Path,
+) -> None:
+    cmap = colors.LinearSegmentedColormap(
+        "rccn_tw_single",
+        {
+            "red": ((0.0, 0.22, 0.0), (0.5, 1.0, 1.0), (1.0, 0.89, 1.0)),
+            "green": ((0.0, 0.49, 0.0), (0.5, 1.0, 1.0), (1.0, 0.12, 1.0)),
+            "blue": ((0.0, 0.72, 0.0), (0.5, 0.0, 0.0), (1.0, 0.11, 1.0)),
+        },
+    )
+    for strain in strains:
+        by_tw = lags_by_strain_tw[strain.name]
+        t_ws = sorted(by_tw)
+        max_lag = max(float(np.max(lags)) for lags in by_tw.values())
+        fig, ax = plt.subplots(figsize=(6.4, 4.6))
+        for color_i, t_w in zip(np.linspace(0.25, 1.0, len(t_ws)), t_ws):
+            xs, ys = one_minus_cdf(by_tw[t_w])
+            ax.plot(xs, ys, color=cmap(color_i), lw=2.0, label=f"T_w={t_w}")
+        ax.set_title(f"{strain.name}: lag 1-CDFs across waiting times")
+        ax.set_xlabel("Recovery lag")
+        ax.set_ylabel("1-CDF")
+        ax.set_yscale("log")
+        ax.set_ylim(1e-4, 1.1)
+        ax.set_xlim(0, max(50.0, max_lag * 1.05))
+        ax.grid(alpha=0.22)
+        ax.legend(frameon=False, fontsize=8)
+        fig.tight_layout()
+        fig.savefig(out_dir / f"aging_1cdf_{strain.name}_2000.png", dpi=240)
+        fig.savefig(out_dir / f"aging_1cdf_{strain.name}_2000.pdf")
+        plt.close(fig)
+
+
 def plot_tail_cdfs(
     tail_lags: dict[str, np.ndarray],
     strains: list[Strain],
@@ -256,6 +324,7 @@ def main() -> None:
     parser.add_argument("--t-ws", default="20,63,200,632,2000")
     parser.add_argument("--n-realizations", type=int, default=2000)
     parser.add_argument("--tail-t-w", type=int, default=200)
+    parser.add_argument("--train-t-w", type=int, default=200)
     parser.add_argument("--tail-realizations", type=int, default=50000)
     parser.add_argument("--seed", type=int, default=20260628)
     parser.add_argument("--backend", choices=["auto", "numpy", "torch"], default="torch")
@@ -283,6 +352,7 @@ def main() -> None:
         "t_ws": t_ws,
         "n_realizations": args.n_realizations,
         "tail_t_w": args.tail_t_w,
+        "train_t_w": args.train_t_w,
         "tail_realizations": args.tail_realizations,
         "seed": args.seed,
         "backend": args.backend,
@@ -378,8 +448,9 @@ def main() -> None:
 
     write_csv(out_dir / "lag_vs_Tw_summary_2000.csv", summary_rows)
     write_csv(out_dir / f"tail_summary_Tw_{args.tail_t_w}_n_{args.tail_realizations}.csv", tail_rows)
-    plot_lag_vs_tw(summary_rows, strains, out_dir)
+    plot_lag_vs_tw(summary_rows, strains, out_dir, args.train_t_w)
     plot_aging_cdf_grid(lags_by_strain_tw, strains, out_dir)
+    plot_individual_aging_cdfs(lags_by_strain_tw, strains, out_dir)
     plot_tail_cdfs(tail_lags, strains, args.tail_t_w, args.tail_realizations, out_dir)
 
     print(json.dumps({"event": "done", "out_dir": str(out_dir)}, sort_keys=True), flush=True)
